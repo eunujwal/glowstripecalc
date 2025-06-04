@@ -4,36 +4,47 @@ function App() {
   // State for inputs
   const [monthlyVolume, setMonthlyVolume] = useState(100000);
   const [avgTransaction, setAvgTransaction] = useState(50);
-  const [cardType, setCardType] = useState('domestic');
-  const [paymentMethod, setPaymentMethod] = useState('card');
-  const [currency, setCurrency] = useState('usd');
+  
+  // Payment method volumes (as percentages)
+  const [paymentVolumes, setPaymentVolumes] = useState({
+    domesticCards: 70,
+    internationalCards: 10,
+    ach: 10,
+    stablecoins: 10
+  });
   
   // Additional features
   const [radarEnabled, setRadarEnabled] = useState(true);
-  const [internationalCards, setInternationalCards] = useState(10); // percentage
   const [disputeRate, setDisputeRate] = useState(0.1); // percentage
   const [instantPayouts, setInstantPayouts] = useState(false);
-
-  // Comprehensive Stripe rates
+  const [stablecoinNetwork, setStablecoinNetwork] = useState('efficient'); // efficient or standard
+  const [stablecoinGateway, setStablecoinGateway] = useState('stripe'); // stripe or other
+  const [requiresConversion, setRequiresConversion] = useState(true); // fiat conversion needed
+  const formatNumber = (num) => {
+    if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
+    if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+    return num.toFixed(1);
+  };
+  // Comprehensive rates including stablecoins
   const rates = {
     card: {
       domestic: { percent: 2.9, fixed: 0.30 },
       international: { percent: 3.4, fixed: 0.30 },
       currencyConversion: 1.0, // additional 1%
-      manualEntry: { percent: 3.4, fixed: 0.30 }
     },
     ach: {
       percent: 0.8,
       fixed: 0,
       cap: 5.00
     },
-    link: {
-      card: { percent: 2.9, fixed: 0.30 },
-      bankAccount: { percent: 2.6, fixed: 0.30 }
-    },
-    wallets: { // Apple Pay, Google Pay
-      percent: 2.9,
-      fixed: 0.30
+    stablecoin: {
+      stripe: { percent: 1.5, fixed: 0 }, // Stripe's 1.5% rate
+      other: { percent: 0.9, fixed: 0 }, // Other gateways <1%
+      networkFees: {
+        efficient: 0.05, // $0.05 per transaction (Tron, Solana)
+        standard: 0.10  // $0.10 per transaction (Ethereum)
+      },
+      conversionRate: 0.5 // 0.5% for fiat conversion
     },
     instantPayout: {
       percent: 1.5,
@@ -43,8 +54,26 @@ function App() {
       fee: 15.00
     },
     radar: {
-      perTransaction: 0.05, // waived for standard pricing
+      perTransaction: 0.05,
       fraudTeams: 0.07
+    }
+  };
+
+  // Ensure volumes add up to 100%
+  const handleVolumeChange = (method, value) => {
+    const newValue = Math.max(0, Math.min(100, Number(value)));
+    const otherMethods = Object.keys(paymentVolumes).filter(k => k !== method);
+    const currentOthersTotal = otherMethods.reduce((sum, k) => sum + paymentVolumes[k], 0);
+    
+    if (currentOthersTotal + newValue > 100) {
+      const scale = (100 - newValue) / currentOthersTotal;
+      const newVolumes = { [method]: newValue };
+      otherMethods.forEach(k => {
+        newVolumes[k] = paymentVolumes[k] * scale;
+      });
+      setPaymentVolumes(newVolumes);
+    } else {
+      setPaymentVolumes({ ...paymentVolumes, [method]: newValue });
     }
   };
 
@@ -53,50 +82,93 @@ function App() {
     const numTransactions = monthlyVolume / avgTransaction;
     let totalFees = 0;
     let breakdown = {};
+    let totalSavings = 0;
 
-    // Base card processing
-    if (paymentMethod === 'card') {
-      const domesticVolume = monthlyVolume * (1 - internationalCards / 100);
-      const intlVolume = monthlyVolume * (internationalCards / 100);
+    // Calculate volume for each payment method
+    const volumes = {
+      domesticCards: monthlyVolume * (paymentVolumes.domesticCards / 100),
+      internationalCards: monthlyVolume * (paymentVolumes.internationalCards / 100),
+      ach: monthlyVolume * (paymentVolumes.ach / 100),
+      stablecoins: monthlyVolume * (paymentVolumes.stablecoins / 100)
+    };
+
+    // Domestic cards
+    if (volumes.domesticCards > 0) {
+      const domesticTxns = volumes.domesticCards / avgTransaction;
+      const domesticFees = (volumes.domesticCards * rates.card.domestic.percent) / 100 + 
+                          (domesticTxns * rates.card.domestic.fixed);
+      breakdown.domesticCards = domesticFees;
+      totalFees += domesticFees;
+    }
+
+    // International cards
+    if (volumes.internationalCards > 0) {
+      const intlTxns = volumes.internationalCards / avgTransaction;
+      const intlFees = (volumes.internationalCards * rates.card.international.percent) / 100 + 
+                      (intlTxns * rates.card.international.fixed);
+      const currencyFees = volumes.internationalCards * 0.2 * rates.card.currencyConversion / 100;
       
-      // Domestic cards
-      const domesticFees = (domesticVolume * rates.card.domestic.percent) / 100 + 
-                          (numTransactions * (1 - internationalCards / 100) * rates.card.domestic.fixed);
-      
-      // International cards
-      const intlFees = (intlVolume * rates.card.international.percent) / 100 + 
-                      (numTransactions * (internationalCards / 100) * rates.card.international.fixed);
-      
-      // Currency conversion (assume 20% of international needs conversion)
-      const currencyFees = intlVolume * 0.2 * rates.card.currencyConversion / 100;
-      
-      breakdown.cardProcessing = domesticFees + intlFees;
+      breakdown.internationalCards = intlFees;
       breakdown.currencyConversion = currencyFees;
-      totalFees += domesticFees + intlFees + currencyFees;
+      totalFees += intlFees + currencyFees;
     }
 
     // ACH processing
-    if (paymentMethod === 'ach') {
+    if (volumes.ach > 0) {
+      const achTxns = volumes.ach / avgTransaction;
       const achFeePerTransaction = Math.min(avgTransaction * rates.ach.percent / 100, rates.ach.cap);
-      breakdown.achProcessing = numTransactions * achFeePerTransaction;
+      breakdown.achProcessing = achTxns * achFeePerTransaction;
       totalFees += breakdown.achProcessing;
     }
 
-    // Radar fees (only if not included free)
-    if (radarEnabled && paymentMethod === 'card') {
-      breakdown.fraudProtection = numTransactions * rates.radar.perTransaction;
+    // Stablecoin processing
+    if (volumes.stablecoins > 0) {
+      const stablecoinTxns = volumes.stablecoins / avgTransaction;
+      
+      // Gateway fees
+      const gatewayRate = stablecoinGateway === 'stripe' ? rates.stablecoin.stripe : rates.stablecoin.other;
+      const gatewayFees = (volumes.stablecoins * gatewayRate.percent) / 100;
+      
+      // Network fees
+      const networkFees = stablecoinTxns * rates.stablecoin.networkFees[stablecoinNetwork];
+      
+      // Conversion fees if needed
+      const conversionFees = requiresConversion ? 
+        (volumes.stablecoins * rates.stablecoin.conversionRate) / 100 : 0;
+      
+      breakdown.stablecoinGateway = gatewayFees;
+      breakdown.stablecoinNetwork = networkFees;
+      if (requiresConversion) {
+        breakdown.stablecoinConversion = conversionFees;
+      }
+      
+      totalFees += gatewayFees + networkFees + conversionFees;
+      
+      // Calculate savings vs traditional cards
+      const equivalentCardFees = (volumes.stablecoins * rates.card.domestic.percent) / 100 + 
+                                (stablecoinTxns * rates.card.domestic.fixed);
+      const stablecoinTotalFees = gatewayFees + networkFees + conversionFees;
+      totalSavings += Math.max(0, equivalentCardFees - stablecoinTotalFees);
+    }
+
+    // Radar fees (only for card transactions)
+    if (radarEnabled) {
+      const cardTxns = (volumes.domesticCards + volumes.internationalCards) / avgTransaction;
+      breakdown.fraudProtection = cardTxns * rates.radar.perTransaction;
       totalFees += breakdown.fraudProtection;
     }
 
-    // Dispute fees
-    const disputeCount = numTransactions * (disputeRate / 100);
+    // Dispute fees (mainly for cards)
+    const cardVolume = volumes.domesticCards + volumes.internationalCards;
+    const cardTxns = cardVolume / avgTransaction;
+    const disputeCount = cardTxns * (disputeRate / 100);
     breakdown.disputes = disputeCount * rates.dispute.fee;
     totalFees += breakdown.disputes;
 
     // Instant payout fees
     if (instantPayouts) {
       const payoutFee = Math.max(monthlyVolume * rates.instantPayout.percent / 100, 
-                                rates.instantPayout.minimum * 30); // assume daily payouts
+                                rates.instantPayout.minimum * 30);
       breakdown.instantPayouts = payoutFee;
       totalFees += payoutFee;
     }
@@ -106,28 +178,31 @@ function App() {
       effectiveRate: ((totalFees / monthlyVolume) * 100).toFixed(3),
       numTransactions: Math.round(numTransactions),
       breakdown: breakdown,
-      netRevenue: (monthlyVolume - totalFees).toFixed(2)
+      netRevenue: (monthlyVolume - totalFees).toFixed(2),
+      stablecoinSavings: totalSavings.toFixed(2),
+      volumes: volumes
     };
   };
 
   const results = calculateFees();
+  const totalVolumePercentage = Object.values(paymentVolumes).reduce((sum, v) => sum + v, 0);
 
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Header */}
       <div className="bg-white shadow-sm border-b">
-        <div className="max-w-6xl mx-auto px-4 py-6">
+        <div className="max-w-7xl mx-auto px-4 py-6">
           <h1 className="text-3xl font-bold text-gray-900">
-            💳 Advanced Stripe Fee Calculator
+            💳 Stripe Fee Calculator with Stablecoin Support
           </h1>
           <p className="text-gray-600 mt-2">
-            Comprehensive fee calculation based on official Stripe pricing
+            Compare traditional payments with stablecoin processing fees
           </p>
         </div>
       </div>
 
       {/* Main Content */}
-      <div className="max-w-6xl mx-auto px-4 py-8">
+      <div className="max-w-7xl mx-auto px-4 py-8">
         <div className="grid lg:grid-cols-3 gap-8">
           
           {/* Input Section - Left */}
@@ -160,37 +235,154 @@ function App() {
                     className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
                 </div>
+              </div>
+            </div>
 
+            {/* Payment Method Mix */}
+            <div className="bg-white rounded-lg shadow p-6">
+              <h2 className="text-xl font-semibold mb-6">Payment Method Mix</h2>
+              <p className="text-sm text-gray-600 mb-4">
+                Adjust the percentage of volume for each payment method. Total: {totalVolumePercentage.toFixed(1)}%
+              </p>
+              
+              <div className="space-y-4">
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Primary Payment Method
-                  </label>
-                  <select
-                    value={paymentMethod}
-                    onChange={(e) => setPaymentMethod(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  >
-                    <option value="card">Credit/Debit Cards</option>
-                    <option value="ach">ACH Direct Debit</option>
-                    <option value="link">Link (Stripe)</option>
-                  </select>
+                  <div className="flex justify-between mb-1">
+                    <label className="text-sm font-medium text-gray-700">
+                      Domestic Cards
+                    </label>
+                    <span className="text-sm text-gray-500">2.9% + $0.30</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    value={paymentVolumes.domesticCards}
+                    onChange={(e) => handleVolumeChange('domesticCards', e.target.value)}
+                    className="w-full"
+                  />
+                  <div className="flex justify-between text-xs text-gray-500">
+                    <span>{paymentVolumes.domesticCards.toFixed(1)}%</span>
+                    <span>${(results.volumes.domesticCards).toLocaleString()}</span>
+                  </div>
                 </div>
 
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    International Cards (%)
-                  </label>
+                  <div className="flex justify-between mb-1">
+                    <label className="text-sm font-medium text-gray-700">
+                      International Cards
+                    </label>
+                    <span className="text-sm text-gray-500">3.4% + $0.30</span>
+                  </div>
                   <input
-                    type="number"
-                    value={internationalCards}
-                    onChange={(e) => setInternationalCards(Number(e.target.value))}
+                    type="range"
                     min="0"
                     max="100"
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    value={paymentVolumes.internationalCards}
+                    onChange={(e) => handleVolumeChange('internationalCards', e.target.value)}
+                    className="w-full"
                   />
+                  <div className="flex justify-between text-xs text-gray-500">
+                    <span>{paymentVolumes.internationalCards.toFixed(1)}%</span>
+                    <span>${(results.volumes.internationalCards).toLocaleString()}</span>
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex justify-between mb-1">
+                    <label className="text-sm font-medium text-gray-700">
+                      ACH Direct Debit
+                    </label>
+                    <span className="text-sm text-gray-500">0.8% (max $5)</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    value={paymentVolumes.ach}
+                    onChange={(e) => handleVolumeChange('ach', e.target.value)}
+                    className="w-full"
+                  />
+                  <div className="flex justify-between text-xs text-gray-500">
+                    <span>{paymentVolumes.ach.toFixed(1)}%</span>
+                    <span>${(results.volumes.ach).toLocaleString()}</span>
+                  </div>
+                </div>
+
+                <div className="border-t pt-4">
+                  <div className="flex justify-between mb-1">
+                    <label className="text-sm font-medium text-green-700">
+                      💰 Stablecoins (USDC, USDT)
+                    </label>
+                    <span className="text-sm text-green-600">~1.5% + network fees</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    value={paymentVolumes.stablecoins}
+                    onChange={(e) => handleVolumeChange('stablecoins', e.target.value)}
+                    className="w-full"
+                  />
+                  <div className="flex justify-between text-xs text-gray-500">
+                    <span>{paymentVolumes.stablecoins.toFixed(1)}%</span>
+                    <span>${(results.volumes.stablecoins).toLocaleString()}</span>
+                  </div>
                 </div>
               </div>
             </div>
+
+            {/* Stablecoin Options */}
+            {paymentVolumes.stablecoins > 0 && (
+              <div className="bg-green-50 border border-green-200 rounded-lg shadow p-6">
+                <h2 className="text-xl font-semibold mb-6 text-green-900">Stablecoin Configuration</h2>
+                
+                <div className="grid md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Payment Gateway
+                    </label>
+                    <select
+                      value={stablecoinGateway}
+                      onChange={(e) => setStablecoinGateway(e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-500"
+                    >
+                      <option value="stripe">Stripe (1.5%)</option>
+                      <option value="other">Other Gateway (~0.9%)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Blockchain Network
+                    </label>
+                    <select
+                      value={stablecoinNetwork}
+                      onChange={(e) => setStablecoinNetwork(e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-500"
+                    >
+                      <option value="efficient">Tron/Solana (~$0.05/tx)</option>
+                      <option value="standard">Ethereum (~$0.10/tx)</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="mt-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <label className="font-medium text-gray-700">Fiat Conversion Required</label>
+                      <p className="text-sm text-gray-500">Add 0.5% if converting to/from USD</p>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={requiresConversion}
+                      onChange={(e) => setRequiresConversion(e.target.checked)}
+                      className="h-5 w-5 text-green-600 rounded"
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Additional Features */}
             <div className="bg-white rounded-lg shadow p-6">
@@ -200,7 +392,7 @@ function App() {
                 <div className="flex items-center justify-between">
                   <div>
                     <label className="font-medium text-gray-700">Radar Fraud Protection</label>
-                    <p className="text-sm text-gray-500">+$0.05 per transaction</p>
+                    <p className="text-sm text-gray-500">+$0.05 per card transaction</p>
                   </div>
                   <input
                     type="checkbox"
@@ -236,7 +428,7 @@ function App() {
                     step="0.1"
                     className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
-                  <p className="text-sm text-gray-500 mt-1">$15 per dispute</p>
+                  <p className="text-sm text-gray-500 mt-1">$15 per dispute (cards only)</p>
                 </div>
               </div>
             </div>
@@ -263,6 +455,15 @@ function App() {
                   <div className="text-2xl font-bold">${results.netRevenue}</div>
                   <div className="text-blue-100">Net Revenue</div>
                 </div>
+
+                {Number(results.stablecoinSavings) > 0 && (
+                  <div className="pt-4 border-t border-blue-500">
+                    <div className="text-xl font-bold text-green-300">
+                      +${results.stablecoinSavings}
+                    </div>
+                    <div className="text-blue-100">Saved with Stablecoins</div>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -282,14 +483,42 @@ function App() {
               </div>
             </div>
 
+            {/* Stablecoin Benefits */}
+                  {paymentVolumes.stablecoins > 5 && (
+                    <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+                      <div className="flex items-start">
+                        <span className="text-2xl mr-3">🚀</span>
+                        <div>
+                          <h4 className="font-semibold text-green-900">Stablecoin Benefits</h4>
+                          <ul className="text-sm text-green-700 mt-2 space-y-1">
+                            <li>• Lower processing fees vs cards</li>
+                            <li>• Near-instant settlement</li>
+                            <li>• No chargebacks</li>
+                            <li>• Global reach without FX fees</li>
+                          </ul>
+                          {Number(results.stablecoinSavings) > 0 && (
+                            <div className="mt-3 pt-3 border-t border-green-300">
+                              <p className="font-semibold text-green-900">
+                                Total Monthly Savings: ${formatNumber(Number(results.stablecoinSavings))}
+                              </p>
+                              <p className="text-xs text-green-600 mt-1">
+                                Compared to processing same volume with cards
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
             {/* Volume Discount Alert */}
             {monthlyVolume > 80000 && (
-              <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
                 <div className="flex items-start">
                   <span className="text-2xl mr-3">💡</span>
                   <div>
-                    <h4 className="font-semibold text-green-900">Volume Discount Available</h4>
-                    <p className="text-sm text-green-700 mt-1">
+                    <h4 className="font-semibold text-blue-900">Volume Discount Available</h4>
+                    <p className="text-sm text-blue-700 mt-1">
                       With ${(monthlyVolume).toLocaleString()} monthly volume, you may qualify for custom pricing. 
                       Contact Stripe sales for potential savings.
                     </p>
@@ -300,28 +529,58 @@ function App() {
           </div>
         </div>
 
-        {/* Additional Info */}
-        <div className="mt-8 grid md:grid-cols-2 gap-6">
-          <div className="bg-blue-50 rounded-lg p-6">
-            <h3 className="font-semibold text-blue-900 mb-2">💳 Standard Pricing Includes</h3>
-            <ul className="text-sm text-blue-700 space-y-1">
-              <li>• No setup, monthly, or hidden fees</li>
-              <li>• 100+ features out of the box</li>
-              <li>• 135+ currencies supported</li>
-              <li>• 24×7 phone, chat, and email support</li>
-              <li>• Fast, predictable payouts</li>
-            </ul>
-          </div>
-          
-          <div className="bg-yellow-50 rounded-lg p-6">
-            <h3 className="font-semibold text-yellow-900 mb-2">⚠️ Important Notes</h3>
-            <ul className="text-sm text-yellow-700 space-y-1">
-              <li>• Estimates based on standard pricing</li>
-              <li>• Custom pricing available for large volumes</li>
-              <li>• Additional fees may apply for some features</li>
-              <li>• ACH Direct Debit capped at $5 per transaction</li>
-              <li>• Currency conversion adds 1% to international</li>
-            </ul>
+        {/* Comparison Table */}
+        <div className="mt-8 bg-white rounded-lg shadow p-6">
+          <h3 className="text-lg font-semibold mb-4">Payment Method Comparison</h3>
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead>
+                <tr>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Method</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Volume</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Transactions</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Fees</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Effective Rate</th>
+                </tr>
+              </thead>
+                  <tbody className="divide-y divide-gray-200">
+                      {Object.entries(results.volumes).map(([method, volume]) => {
+                        if (volume === 0) return null;
+                        const txns = Math.round(volume / avgTransaction);
+                        const methodFees = Object.entries(results.breakdown)
+                          .filter(([key]) => key.toLowerCase().includes(method.toLowerCase().replace('Cards', '')))
+                          .reduce((sum, [, value]) => sum + value, 0);
+                        
+                        // Format method name with capital first letter
+                        const formattedMethod = method
+                          .replace(/([A-Z])/g, ' $1')
+                          .trim()
+                          .split(' ')
+                          .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+                          .join(' ');
+                        
+                        return (
+                          <tr key={method}>
+                            <td className="px-4 py-3 text-sm font-medium text-gray-900">
+                              {formattedMethod}
+                            </td>
+                            <td className="px-4 py-3 text-sm text-gray-500">
+                              ${formatNumber(volume)}
+                            </td>
+                            <td className="px-4 py-3 text-sm text-gray-500">
+                              {formatNumber(txns)}
+                            </td>
+                            <td className="px-4 py-3 text-sm text-gray-500">
+                              ${formatNumber(methodFees)}
+                            </td>
+                            <td className="px-4 py-3 text-sm text-gray-500">
+                              {volume > 0 ? ((methodFees / volume) * 100).toFixed(1) : '0.0'}%
+                            </td>
+                          </tr>
+                        );
+                      })}
+                  </tbody>
+            </table>
           </div>
         </div>
       </div>
